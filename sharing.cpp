@@ -53,11 +53,14 @@ using namespace std;                            // cout
 
 #ifdef COUNTER64
 #define VINT    UINT64                          //
+#define VLONG	volatile long long
 #else
 #define VINT    UINT                            //
 #endif
 
 #define ALIGNED_MALLOC(sz, align) _aligned_malloc((sz+align-1)/align*align, align)
+		// Convenient and sticking to notes!!
+#define CAS(a,e,n) InterlockedCompareExchange64(a,n,e)
 
 #ifdef FALSESHARING
 #define GINDX(n)    (g+n)                       //
@@ -66,14 +69,15 @@ using namespace std;                            // cout
 #endif
 
 int MAXTHREAD = 2*getNumberOfCPUs();
+volatile long long lock = 0;
 //
 // 0:inc
 // 1:InterlockedIncrement
 // 2:InterlockedCompareExchange
 // 3:RTM (restricted transactional memory)
-//
+// 4:TestAndSet Lock
 
-#define OPTYP       1                           // set op type
+#define OPTYP      4                         // set op type
 
 #if OPTYP == 0
 
@@ -115,7 +119,29 @@ int MAXTHREAD = 2*getNumberOfCPUs();
                             break;                                                              \
                         }                                                                       \
                     }
+#elif OPTYP == 4
+#define OPSTR		"TestAndSet Lock" 
+#define INC(g)      while(InterlockedExchange64(&lock,1))										\
+					(*g)++;																		\
+					lock = 0;
 
+#elif OPTYP == 5
+#define OPSTR		"TestAndTestAndSet Lock"
+#define INC(g)		while(InterlockedExchange64(&lock,1))	\
+						while(lock == 1)					\
+							_mm_pause();					\
+					(*g)++;									\
+					lock = 0;
+
+#elif OPTYP == 6
+#define OPSTR		"MCS Lock"
+//#define INC(g)
+DWORD tlsIndex= TlsAlloc();
+classQNode: publicALIGNEDMA<QNode> {
+public:
+	volatileintwaiting;
+	volatileQNode*next;
+};
 #endif
 
 UINT64 tstart;                                  // start of test in ms
@@ -136,6 +162,7 @@ typedef struct {
 } Result;
 
 Result *r;                                      // results
+
 int indx;                                       // results index
 
 volatile VINT *g;                               // NB: position of volatile
@@ -255,7 +282,6 @@ void release_lock(int pid) {
 WORKER worker(void *vthread)
 {
     int thread = (int)((size_t) vthread);
-//	printf("Thread created %d\n", thread);
     UINT64 ops = 0;
     
     volatile VINT *gt = GINDX(thread);
@@ -264,30 +290,22 @@ WORKER worker(void *vthread)
 #if OPTYP == 2
     VINT x;
 #endif
-
+#if OPTYP == 4
+//	VLONG lock = 0;
+#endif
     runThreadOnCPU(thread % ncpus);
-	//acquire(thread);
-	acquire(thread);
-	_mm_mfence();
     while (1) {
         //
         // do some work
         //
-		
-		//_mm_mfence();
-	    
         for (int i = 0; i < NOPS / 4; i++) {
-//			acquire(thread);
-			//_mm_mfence();
-			s_counter++;
-			_mm_lfence();
+
             switch (sharing) {
             case 0:
                 INC(gt);
                 INC(gt);
                 INC(gt);
                 INC(gt);
-//				cout << s_counter << endl;
                 break;
 
             case 25:
@@ -317,6 +335,8 @@ WORKER worker(void *vthread)
                 INC(gs);
                 INC(gs);
 				break;
+			default:
+				break;
             }
 
         }
@@ -328,15 +348,8 @@ WORKER worker(void *vthread)
         //
         if ((getWallClockMS() - tstart) > NSECONDS*1000)
             break;
-		//break;
-		
-
-//		_mm_lfence();
     }
-	
     cnt[thread] = ops;
-	release_lock(thread);
-	_mm_lfence();
     return 0;
 
 }
@@ -455,7 +468,7 @@ int main()
 
     for (sharing = 0; sharing <= 100; sharing += 25) {
 		
-		
+		cout << "sharing : "<<sharing<<endl;
         for (int nt = 1; nt <= maxThread; nt *= 2, indx++) {
             
             //

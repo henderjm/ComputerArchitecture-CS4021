@@ -535,6 +535,36 @@ int *fd;
 //
 // openPMS
 //
+
+/* Aliigned memory allocation */
+template <class T>
+class ALIGNEDMA {
+
+public:
+
+    void * operator new(size_t);     // override new
+    void operator delete(void*);    // override delete
+
+};
+
+//
+// new
+//
+template <class T>
+void* ALIGNEDMA<T>::operator new(size_t sz)
+{
+    return _aligned_malloc(sz, lineSz);
+}
+
+//
+// delete
+//
+template <class T>
+void ALIGNEDMA<T>::operator delete(void *p)
+{
+    _aligned_free(p);
+}
+
 int openPMS()
 {
     char fn[32];

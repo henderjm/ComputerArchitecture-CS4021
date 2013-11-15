@@ -51,16 +51,25 @@ using namespace std;                            // cout
 //#define FALSESHARING                          // 
 #define COUNTER64                               // comment for 32 bit counter
 
+#pragma region BakeryLock
+/* bakery lock */
+int number[8];
+int choosing[8];  
+#pragma endregion BakeryLock
+
+
+
 #ifdef COUNTER64
 #define VINT    UINT64                          //
 #define VLONG	volatile long long
 #else
 #define VINT    UINT                            //
+#define VLONG	volatile long
 #endif
 
 #define ALIGNED_MALLOC(sz, align) _aligned_malloc((sz+align-1)/align*align, align)
 		// Convenient and sticking to notes!!
-#define CAS(a,e,n) InterlockedCompareExchange64(a,n,e)
+//#define CAS(a,e,n) InterlockedCompareExchange64(a,n,e)
 
 #ifdef FALSESHARING
 #define GINDX(n)    (g+n)                       //
@@ -69,15 +78,68 @@ using namespace std;                            // cout
 #endif
 
 int MAXTHREAD = 2*getNumberOfCPUs();
-volatile long long lock = 0;
+/*
+	Allocating alligned memory space
+*/
+template <class T>
+class ALIGNEDMA {
+
+public:
+
+    void * operator new(size_t);     // override new
+    void operator delete(void*);    // override delete
+
+};
+
+/*
+	New alligned memory pool 
+*/
+template <class T>
+void* ALIGNEDMA<T>::operator new(size_t sz) // size_t is an unsigned integer which can hold an address
+{
+	//ALIGNED_MALLOC(sz, lineSz);
+    return _aligned_malloc(sz, lineSz);
+}
+
+/*
+	Delete alligned memory pool
+*/
+template <class T>
+void ALIGNEDMA<T>::operator delete(void *p)
+{
+    _aligned_free(p);
+}
+// Derive QNode from ALIGNEDMA
+// each object will be allocated its own cache line aligened on a cache line boundary
+class QNode: public ALIGNEDMA<QNode> {
+public:
+    volatile int waiting;
+    volatile QNode*next;
+};
+
+
+#define OPTYP      6                         // set op type
 //
 // 0:inc
 // 1:InterlockedIncrement
 // 2:InterlockedCompareExchange
 // 3:RTM (restricted transactional memory)
 // 4:TestAndSet Lock
+// 5:TestAndTestAndSet Lock
+// 6:MCS Lock
+// 7:Bakery Lock
 
-#define OPTYP      4                         // set op type
+
+
+//INIT LOCK VAR
+#if OPTYP == 5 || OPTYP == 4
+	VLONG lock = 0;
+
+#elif OPTYP == 6
+	QNode * lock; // big mistake made here.. DO NOT DO -> QNode * lock = new QNode(); .. ma gad!
+#elif OPTYP == 7
+	int proc_id = 0;
+#endif
 
 #if OPTYP == 0
 
@@ -121,27 +183,81 @@ volatile long long lock = 0;
                     }
 #elif OPTYP == 4
 #define OPSTR		"TestAndSet Lock" 
-#define INC(g)      while(InterlockedExchange64(&lock,1))										\
+#define INC(g)      while(InterlockedExchange64(&lock,1));										\
 					(*g)++;																		\
 					lock = 0;
 
 #elif OPTYP == 5
 #define OPSTR		"TestAndTestAndSet Lock"
-#define INC(g)		while(InterlockedExchange64(&lock,1))	\
-						while(lock == 1)					\
-							_mm_pause();					\
-					(*g)++;									\
+#define INC(g)		while(InterlockedExchange64(&lock,1))										\
+						while(lock == 1)														\
+							_mm_pause();														\
+					(*g)++;																		\
 					lock = 0;
 
 #elif OPTYP == 6
-#define OPSTR		"MCS Lock"
+#define OPSTR       "MCS Lock"
 //#define INC(g)
-DWORD tlsIndex= TlsAlloc();
-classQNode: publicALIGNEDMA<QNode> {
-public:
-	volatileintwaiting;
-	volatileQNode*next;
-};
+#define INC(g)      acquire(&lock);                         \
+                    (*g)++;                                 \
+                    release(&lock);   
+DWORD tlsIndex;
+inline void acquire(QNode**lock){
+	
+    volatile QNode *qn = (QNode*) TlsGetValue(tlsIndex);
+    qn->next = NULL;
+    volatile QNode * pred= (QNode*) InterlockedExchangePointer((PVOID*) lock, (PVOID) qn);
+    if(pred== NULL)
+        return;
+    qn->waiting = 1;
+    pred->next = qn;
+    while(qn->waiting)
+		Sleep(0);
+}
+inline void release(QNode**lock) {
+    volatile QNode *qn = (QNode*) TlsGetValue(tlsIndex);
+    volatile QNode * succ;
+    if(!(succ = qn->next)) {
+        if(InterlockedCompareExchangePointer((PVOID*)lock,NULL,(PVOID)qn) == qn)
+            return;
+        do {
+            succ= qn->next;
+        }while(!succ);
+    }
+    succ->waiting = 0;
+}
+    
+#elif OPTYP == 7
+#define OPSTR		"Bakery Lock"
+#define DECLARE()	int p_id
+#define INC(g)		acquire();					\
+					_mm_mfence();					\
+					(*g)++;							\
+					release_lock(p_id);				\
+					_mm_lfence();
+inline void acquire(int pid) {
+	choosing[pid] = 1;
+	int max =0;
+	for(int i = 0; i < 8; i++) {
+		if(number[i] > max)
+			max = number[i];
+	}
+	number[pid] = max + 1;
+	choosing[pid] = 0;
+	for(int  j = 0; j < 8; j++) {
+		while(choosing[j]);
+	//	cout << "j = " << j << "\tnumber[j] = "<<number[j]<<"\tnumber[pid]" << number[pid] << endl;
+		while((number[j]!=0) && ((number[j] < number[pid]) || ((number[j] == number[pid]) && (j <pid)))){
+			_mm_lfence();
+		}
+	}
+}
+inline void release_lock(int pid) {
+//	cout << "Releasing number["<<pid<<"] which = " << number[pid] << endl;
+	number[pid] = 0;
+	_mm_lfence();
+//	printf("Released ticket %d\n" , number[pid]);
+}
 #endif
 
 UINT64 tstart;                                  // start of test in ms
@@ -246,36 +362,10 @@ void saveCounters()
 
 }
 
-/* bakery lock */
-int number[8];
-int choosing[8];
-void acquire(int pid) {
-	//cout << "Thread trying to acquire:   " << pid << "\tnumber[pid] = " << number[pid] << endl;
-	choosing[pid] = 1;
-	int max =0;
-	for(int i = 0; i < 8; i++) {
-		if(number[i] > max)
-			max = number[i];
-	}
-	number[pid] = max + 1;
-	choosing[pid] = 0;
-	for(int  j = 0; j < 8; j++) {
-		while(choosing[j]);
-	//	cout << "j = " << j << "\tnumber[j] = "<<number[j]<<"\tnumber[pid]" << number[pid] << endl;
-		while((number[j]!=0) && ((number[j] < number[pid]) || ((number[j] == number[pid]) && (j <pid)))){
-//			cout << pid << endl; // don't know why, but if I don't have a statement here my program hangs. . .
-			_mm_lfence();
-		}
-	}
-	_mm_sfence();
-}	
 
-void release_lock(int pid) {
-//	cout << "Releasing number["<<pid<<"] which = " << number[pid] << endl;
-	number[pid] = 0;
-	_mm_lfence();
-//	printf("Released ticket %d\n" , number[pid]);
-}
+
+
+
 //
 // worker
 //
@@ -283,15 +373,19 @@ WORKER worker(void *vthread)
 {
     int thread = (int)((size_t) vthread);
     UINT64 ops = 0;
-    
+    int pid = thread;
     volatile VINT *gt = GINDX(thread);
     volatile VINT *gs = GINDX(maxThread);
 
 #if OPTYP == 2
     VINT x;
-#endif
-#if OPTYP == 4
-//	VLONG lock = 0;
+#elif OPTYP == 6
+    QNode * q = new QNode();
+	q->next = NULL;
+	q->waiting = 0;
+    TlsSetValue(tlsIndex, q);
+#elif OPTYP == 7
+	DECLARE() = thread;
 #endif
     runThreadOnCPU(thread % ncpus);
     while (1) {
@@ -413,6 +507,9 @@ int main()
         return 1;
     }
 
+#endif
+#if OPTYP == 6
+	tlsIndex = TlsAlloc();
 #endif
 
     cout << endl;

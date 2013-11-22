@@ -118,7 +118,7 @@ public:
 };
 
 
-#define OPTYP      6                         // set op type
+#define OPTYP           0                // set op type
 //
 // 0:inc
 // 1:InterlockedIncrement
@@ -132,7 +132,7 @@ public:
 
 
 //INIT LOCK VAR
-#if OPTYP == 5 || OPTYP == 4
+#if OPTYP == 5 || OPTYP == 4 
 	VLONG lock = 0;
 
 #elif OPTYP == 6
@@ -183,16 +183,19 @@ public:
                     }
 #elif OPTYP == 4
 #define OPSTR		"TestAndSet Lock" 
-#define INC(g)      while(InterlockedExchange64(&lock,1));										\
+#define INC(g)      while(InterlockedExchange64(&lock, 1));										\
 					(*g)++;																		\
 					lock = 0;
 
+void _acquire(VLONG lock) {
+	while(InterlockedExchange64(&lock, 1));
+}
 #elif OPTYP == 5
 #define OPSTR		"TestAndTestAndSet Lock"
-#define INC(g)		while(InterlockedExchange64(&lock,1))										\
-						while(lock == 1)														\
-							_mm_pause();														\
-					(*g)++;																		\
+#define INC(g)		while(InterlockedExchange64(&lock,1))										
+						while(lock == 1)														
+							_mm_pause();														
+					(*g)++;																		
 					lock = 0;
 
 #elif OPTYP == 6
@@ -230,11 +233,12 @@ inline void release(QNode**lock) {
 #elif OPTYP == 7
 #define OPSTR		"Bakery Lock"
 #define DECLARE()	int p_id
-#define INC(g)		acquire();					\
+#define INC(g)		acquire(p_id);					\
 					_mm_mfence();					\
 					(*g)++;							\
 					release_lock(p_id);				\
 					_mm_lfence();
+
 inline void acquire(int pid) {
 	choosing[pid] = 1;
 	int max =0;
@@ -248,7 +252,7 @@ inline void acquire(int pid) {
 		while(choosing[j]);
 	//	cout << "j = " << j << "\tnumber[j] = "<<number[j]<<"\tnumber[pid]" << number[pid] << endl;
 		while((number[j]!=0) && ((number[j] < number[pid]) || ((number[j] == number[pid]) && (j <pid)))){
-			_mm_lfence();
+	//		_mm_lfence();
 		}
 	}
 }
@@ -373,7 +377,6 @@ WORKER worker(void *vthread)
 {
     int thread = (int)((size_t) vthread);
     UINT64 ops = 0;
-    int pid = thread;
     volatile VINT *gt = GINDX(thread);
     volatile VINT *gs = GINDX(maxThread);
 
@@ -388,7 +391,7 @@ WORKER worker(void *vthread)
 	DECLARE() = thread;
 #endif
     runThreadOnCPU(thread % ncpus);
-    while (1) {
+    do {
         //
         // do some work
         //
@@ -440,9 +443,10 @@ WORKER worker(void *vthread)
         //
         // check if runtime exceeded
         //
-        if ((getWallClockMS() - tstart) > NSECONDS*1000)
-            break;
-    }
+       
+    } while (!((getWallClockMS() - tstart) > NSECONDS*1000));
+            
+	
     cnt[thread] = ops;
     return 0;
 
@@ -454,7 +458,7 @@ WORKER worker(void *vthread)
 int main()
 {
     ncpus = getNumberOfCPUs();  // # of logical CPUs
-    maxThread = 2 * ncpus;      // max # threads to run
+    maxThread = 2* ncpus;      // max # threads to run
 
     //
     // get date
@@ -565,7 +569,6 @@ int main()
 
     for (sharing = 0; sharing <= 100; sharing += 25) {
 		
-		cout << "sharing : "<<sharing<<endl;
         for (int nt = 1; nt <= maxThread; nt *= 2, indx++) {
             
             //

@@ -238,6 +238,49 @@ volatile int List::count(int s) {
 
 #pragma endregion CLASS_LIST
 
+int retireQ(List * l, Node * n) {
+	Node * tmp = l->head;
+	if(tmp == NULL)
+		return 0; // nothing in retireQ
+	int rcount = 1;
+	while(tmp->next!=NULL)
+		rcount++;
+	tmp->link = n;
+	n->link = NULL;
+	return rcount; // size of retireQ
+}
+
+int retireQtoreuseQ(UINT64 ts, List * req, List * reu) {
+	Node * tmp = req->head;
+	if(tmp != NULL) {
+		while(true) {
+			if(tmp->key < ts){
+				reu->add(tmp->key);
+				req->remove(tmp->key);
+			}else{
+				break;
+			}
+		}
+	} else {
+		return 0; // no nodes in req
+	}
+	return 1;
+}
+Node * reuseQ(List * l, UINT64 k, UINT64 ts) {
+	Node * tmp = l->head;
+	if(tmp == NULL) {
+		// call retireQ
+		// grab nodes under a certain ts
+		if(retireQ == 0)
+			return tmp;
+
+	}
+	tmp->key = k;
+	tmp->link = NULL;
+	tmp->next = NULL;
+	return tmp;
+
+}
 int acquire(volatile long long &lock, List * l) {
 	while(InterlockedExchange64(&lock,1))										
 		while(lock == 1)													
@@ -302,7 +345,14 @@ WORKER worker(void *vthread) {
 				if(new_key & 1) list->add(new_key);
 				else list->remove(new_key);
 				*/
+				if(new_key & 1) {
+					if(reuse->count == 0)
+						if(!retireQtoreuseQ(threadts[thread], retire, reuse)) {
+							Node * newNode = new Node(new_key>>1, NULL);
+						} else {
 
+						}
+				}
 				new_key & 1 ? list->add(new_key >> 1) : list->remove(new_key >> 1); // sweet!
 				_mm_mfence();
 				//		if(new_key & 17000) { printf("List size: %d\n", ns ); ns++; }

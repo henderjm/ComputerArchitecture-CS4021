@@ -10,7 +10,6 @@
 #include <Windows.h>
 #include <atomic>
 #include "Node.h"
-
 using namespace std;
 
 #define K           1024                        //
@@ -24,8 +23,12 @@ using namespace std;
 #define MARKED(n) ((Node*) ((size_t) n | 1))// NB: size_t
 #define UNMARKED(n) ((Node*) ((size_t) n & ~1))// NB: size_t
 #define MAXKEY 16384
-
+int nt;
+#define H (2 * nt)
+#define R (100 + 2*H)
 THREADH *threadH;                               // thread handles
+UINT64 * threadts;
+
 #define ALIGNED_MALLOC(sz, align) _aligned_malloc((sz+align-1)/align*align, align)
 #define CAS(a,e,n) InterlockedCompareExchangePointer(a,n,e)
 
@@ -34,11 +37,14 @@ __declspec(align(64)) UINT64 cnt1;
 __declspec(align(64)) UINT64 cnt2; 
 UINT64 * cnt; // calculate ops 
 UINT64 cnt3;
+
 int lineSz;
 UINT64 tstart;                                  // start of test in ms
 int maxkey;
-int nmallocs;
-int nodes;
+volatile int nmallocs;
+int * nodes;
+volatile long long lock = 0;
+
 
 typedef struct {
 	int sharing;                                // sharing
@@ -49,7 +55,8 @@ typedef struct {
 	UINT64 *cnt;                                // ops for each thread
 	UINT64 mkeys;
 	UINT64 nmalls;
-	UINT64 nnodes;
+	UINT64 *nnodes;
+	UINT64 nnodes2;
 } Result;
 int indx;
 #pragma region MEMORY_POOL
@@ -66,7 +73,7 @@ template <class T>
 void* ALIGNEDMA<T>::operator new(size_t sz) // size_t is an unsigned integer which can hold an address
 {
 	//ALIGNED_MALLOC(sz, lineSz);
-	nmallocs++;
+	//	nmallocs++;
 	return _aligned_malloc(sz, lineSz);
 }
 
@@ -85,49 +92,52 @@ void ALIGNEDMA<T>::operator delete(void *p)
 
 class Node : public ALIGNEDMA<Node> {
 public:
-	volatile int key;
+	volatile UINT64 key;
 	Node * next;
-	Node(int, Node*);
+	Node * link;
+	Node(UINT64, Node*);
 };
 
 
-Node::Node(int k, Node * n) {
+Node::Node(UINT64 k, Node * n) {
 	this->key = k;
 	this->next = n;
+	this->link = NULL;
 }
 
 #pragma endregion CLASS_NODE
 
 #pragma region CLASS_LIST
 
-class List : public ALIGNEDMA<Node> {
+class List : public ALIGNEDMA<List> {
 public:
 	List();
 	~List();
-	int add(int);
-	int remove(int);
+	int add(UINT64);
+	int remove(UINT64);
+	volatile int count(int);
 	Node * volatile head;
 private:
 
-	int find(int, Node* volatile *&, Node * &, Node * &);
+	int find(UINT64, Node* volatile *&, Node * &, Node * &);
 };
-
+List *retire; List *reuse;
 List::List() {
 	head = new Node(0, NULL);
 	nmallocs++;
 }
 
 List::~List() {
-	Node * temp;// = head->next;
-	while(temp = head->next) {
+	while (head) {
+		Node *tmp = head->next;
 		delete head;
-		head = temp;
+		head = tmp;
 	}
 }
 
-int List::add(int key) {
+int List::add(UINT64 key) {
 	Node *volatile *pred,*curr,*succ, *newNode = NULL;
-	nmallocs+=4;
+	//	nmallocs++;
 	do {
 		if(find(key, pred, curr, succ)) {// curr and pred will be unmarked
 			if(newNode)
@@ -135,10 +145,10 @@ int List::add(int key) {
 			return 0;
 		}
 		if (newNode== NULL){
-			newNode= new Node(key, NULL);
+			newNode= new Node(key, curr);
 			nmallocs++;
 		}
-		newNode->next = curr;
+		//		newNode->next = curr;
 		//		InterlockedCompareExchangePointer((volatile PVOID*)pred, newNode, (PVOID) curr) == curr ? ret = true : ret = false;
 		if(CAS((volatile PVOID*)pred, (PVOID) curr, newNode) == curr){
 			nodes++;
@@ -152,37 +162,48 @@ int List::add(int key) {
 	return 1;
 }
 
-int List::remove(int key) {
+int List::remove(UINT64 key) {
 	Node * volatile * pred;
 	Node * curr, * succ;
-	nmallocs += 3;
+	//	nmallocs += 3;
 	while(true) {
 		if(find(key, pred, curr, succ) == 0) {
+			
 			return 0;
 		}
 		if(CAS((volatile PVOID*) &curr->next, succ, MARKED(succ)) != succ) {
+			
 			continue;
 		}
 		if(CAS((volatile PVOID*) pred, curr, succ) != curr) {
 			find(key, pred, curr, succ);
 		}
+		
+	//	succ->next->key = __rdtsc();
 		return 1;
 	}
 }
 
-int List::find(int k, Node * volatile *& pred, Node * &curr, Node * &succ) {
+int List::find(UINT64 k, Node* volatile*&pred, Node *&curr, Node *&succ) {
 retry:
 	pred = &head;
 	curr = *pred;
 	while(curr) { // iterate through list
 		succ =  curr->next;
 		if(ISMARKED(succ)) { // remove
-			if(CAS((volatile PVOID*) pred, curr, UNMARKED(succ)) != curr)
+
+			if(CAS((volatile PVOID*) pred, curr, UNMARKED(succ)) != curr) {
+				curr->key = __rdtsc();
+				retire->add(curr->key); // adding to retireQ
 				goto retry;
+			}
+			//				// deferred deletion
+			//    		retire->add(succ->key); // adding to retireQ
 			curr = UNMARKED(succ);
 		} else {
 			int ckey = curr->key; // copied key
-			// [TODO] make sure hasnt been changed
+			if(*pred != curr)
+				goto retry;
 			if(ckey >= k) {
 				return (ckey == k);
 			}
@@ -194,28 +215,88 @@ retry:
 	return 0;
 }
 
+/* Pretty Print List */
+volatile int List::count(int s) {
+	Node * iter = head;
+	//	printf("blah\t%d\n", iter->next->key);
+	if(iter->next == NULL) {
+		return 1;
+	}
+	/*	for(iter; iter != NULL; iter = iter->next) {
+	s++;
+	if(iter->next == NULL)
+	return s;
+	}*/
+
+	while(iter) {
+		s++;
+		iter = iter->next;
+	}
+
+	return s;
+}
+
 #pragma endregion CLASS_LIST
 
-/* Pretty Print List */
-void prettyprint(List *l) {
-	Node * iter = l->head;
-	printf("blah\t%d\n", iter->next->key);
-	for(iter; iter != NULL; iter = iter->next) {
-		nodes++;
-	}
+int acquire(volatile long long &lock, List * l) {
+	while(InterlockedExchange64(&lock,1))										
+		while(lock == 1)													
+			_mm_pause();
+	int c = 0;
+	c = l->count(c);
+	lock = 0;
+	return c;
 }
+#pragma region HAZARD
+// Hazard pointer record
+/*class HPRecType {
+HPRecType();
+~HPRecType();
+Node * HP[2];
+HPRecType * headHPRec;
+HPRecType * next;
+void retireNode(Node * n);
+private:
+List rlist;
+int rcount;
+};
+HPRecType::HPRecType() {
+rlist.head = NULL;
+rcount = 0;
+}
+
+void HPRecType::retireNode(Node * node) {
+rlist.add(node->key);
+rcount++;
+if(rcount >= R) 
+Scan(headHPRec);
+}
+
+void Scan(HPRecType *) {
+}*/
+
+#pragma endregion HAZARD
+//HPRecType * hp;
 
 List *list;
 
+UINT64 * size; // size of lists
 WORKER worker(void *vthread) {
 	int thread = (int)((size_t) vthread);
+	retire = new List();
+	reuse = new List(); // pair of to-be-freed lists for each thread.
 	UINT64 ops;
+	int ns = 0;
+	int list_size = 0;
+	nmallocs = 0;
 	srand(thread);
 	runThreadOnCPU(thread % ncpus);
 	try { // avoiding out of memory!
 
 		do {
 			for(int i = 0; i < NOPS / 4; i++) {
+				threadts[thread] = __rdtsc();
+
 				int new_key = rand() % (maxkey * 2); // multiply maxkey * 2 so on >> 1, back to inside range
 				/*
 				if(new_key & 1) list->add(new_key);
@@ -223,15 +304,19 @@ WORKER worker(void *vthread) {
 				*/
 
 				new_key & 1 ? list->add(new_key >> 1) : list->remove(new_key >> 1); // sweet!
-				if(new_key & 1) printf("Operation added: %d\n", new_key >> 1);
-//				else printf("Operation removed: %d\n", new_key >> 1);
+				_mm_mfence();
+				//		if(new_key & 17000) { printf("List size: %d\n", ns ); ns++; }
+
+
 			}
-//			ops += NOPS;
 		}while(!((getWallClockMS() - tstart) > NSECONDS *1000));
 	} catch (std::bad_alloc) {
 		perror("bad memory");
 	}
-//	cnt[thread] = ops;
+	//	list_size = acquire(lock, list);
+	size[thread] = ns;
+	//	release(&lock);
+	//	cnt[thread] = ops;
 	return 0;
 }
 // MAIN
@@ -239,15 +324,7 @@ int main() {
 
 	// QUICKTEST LIST
 	list = new List();
-	list->add(2);
-	list->add(1);
-	list->add(5);
-	list->add(4);
-	list->remove(2);
-	list->remove(0);
-	list->add(4);
-	list->remove(3);
-	// QUICKTEST END
+
 	ncpus = getNumberOfCPUs();  // # of logical CPUs
 	int maxThread = 2* ncpus;      // max # threads to run
 	indx = 0;
@@ -284,24 +361,27 @@ int main() {
 		cout << "Warning: cnt3 shares cache line used by cnt1" << endl;
 	if ((&cnt3 >= &cnt2) && (&cnt3 < (&cnt2 + lineSz / sizeof(UINT64))))
 		cout << "Warning: cnt2 shares cache line used by cnt1" << endl;
-
+	nodes = (int*) malloc(maxThread*sizeof(int));
 	threadH = (THREADH*) ALIGNED_MALLOC(maxThread*sizeof(THREADH), lineSz);             // thread handles
 	cnt = (UINT64*) ALIGNED_MALLOC(maxThread*sizeof(UINT64), lineSz);	// calculate ops/s
+	size = (UINT64*) ALIGNED_MALLOC(maxThread*sizeof(UINT64), lineSz);
 	delete list;
 	Result * r = (Result*) ALIGNED_MALLOC(5*maxThread*sizeof(Result), lineSz);
 	memset(r,0,5*maxThread*sizeof(Result));
 	for (int i = 0; i < 5*maxThread; i++) {                                             //
 		r[i].cnt = (UINT64*) ALIGNED_MALLOC(maxThread*sizeof(UINT64), lineSz);          // for results
 		memset(r[i].cnt, 0, maxThread*sizeof(UINT64));                                  //
+		r[i].nnodes = (UINT64*) ALIGNED_MALLOC(maxThread*sizeof(UINT64), lineSz);          // for results
+		memset(r[i].nnodes, 0, maxThread*sizeof(UINT64));
 	}   
 
-	for(maxkey = 16; maxkey <= MAXKEY; maxkey *= 4) {
-		
-		for(int nt = 1; nt <= maxThread; nt *= 2, indx++) {
+	for(maxkey = 64; maxkey <= MAXKEY; maxkey *= 4) {
+
+		for(nt = 1; nt <= maxThread; nt *= 2, indx++) {
 
 			list = new List();
-			nmallocs = 0;
-			nodes = 0;
+			int l_size = 0;
+			threadts = (UINT64*) ALIGNED_MALLOC(nt*sizeof(UINT64), lineSz);
 			//
 			// get start time
 			//
@@ -317,6 +397,7 @@ int main() {
 			// wait for ALL worker threads to finish
 			//
 			waitForThreadsToFinish(nt, threadH);
+			l_size = acquire(lock, list);
 			int runtime = clock() - tstart;
 
 			//
@@ -335,33 +416,42 @@ int main() {
 			//           cout << " ops/s=" << setw(8) << opspersec << " relative=" << fixed << setprecision(2) << (double) opspersec / opspersec1 << endl;
 			for (int thread = 0; thread < nt; thread++) {
 				r[indx].cnt[thread] = cnt[thread];
-				r[indx].mallocs = nmallocs;
-				total += cnt[thread];
+				r[indx].nmalls = nmallocs;
+				r[indx].nnodes[thread] = size[thread];
+				r[indx].nnodes2 = l_size;
+				r[indx].mkeys = maxkey;
+				total += size[thread];
 			}
+			cout << "maxkey= " << setw(3) << maxkey << " threads= " << setw(2) << nt;
+			cout << " mallocs= " << setw(5) << nmallocs;
+			cout << " listQ= " << setw(5) << l_size << endl;
 			//
 			// delete thread handles
 			//
 			for (int thread = 0; thread < nt; thread++)
 				closeThread(threadH[thread]);
 			// PRINT RESULTS
-			r[indx].mkeys = maxkey;
-			r[indx].nmalls = nmallocs;
-			r[indx].nnodes = nodes;
-			printf("\nMAXKEY: %d\tthreads: %d\tMallocs: %d\tNodes: %d\n", maxkey, nt,nmallocs,nodes);
-			std::cout << " ops= " << setw(11) << total << " relative= " << setw(5) << fixed << setprecision(2) << (double) total << std::endl;
-			list->~List();
+			//			r[indx].mkeys = maxkey;
+			//			r[indx].nmalls = nmallocs;
+			//			r[indx].nnodes = nodes;
+			//		printf("\nMAXKEY: %d\tthreads: %d\tMallocs: %d\tNodes: %d\n", maxkey, nt,nmallocs,nodes);
+			//		std::cout << " ops= " << setw(11) << total << " relative= " << setw(5) << fixed << setprecision(2) << (double) total << std::endl;
+			delete list;
+			//	delete retire;
 		}
 	}
 	/*cout << "mallocs, sharing, nt, rt, diff, ops for each thread" << endl; 
 	for (int i = 0; i < indx; i++) {
-		cout <<  r[i].mallocs<< r[i].sharing << "/"  << r[i].nt << "/" << r[i].rt << "/"  << r[i].diff ;
-		for (int j = 0; j < maxThread; j++)
-			cout << "/" << r[i].cnt[j];
-		cout << endl;
+	cout <<  r[i].mallocs<< r[i].sharing << "/"  << r[i].nt << "/" << r[i].rt << "/"  << r[i].diff ;
+	for (int j = 0; j < maxThread; j++)
+	cout << "/" << r[i].cnt[j];
+	cout << endl;
 	}*/
-	cout << "malls / nodes" << endl;
+	cout << "maxkeys / size / malls / nodes" << endl;
 	for (int i = 0; i < indx; i++) {
-		cout << r[i].nmalls << "/" << r[i].nnodes << endl;
+		cout << r[i].mkeys << '/' << r[i].nnodes2 << '/' << r[i].nmalls;
+
+		cout << endl;
 	}
 	printf("list\n");
 
